@@ -33,7 +33,7 @@ E24LC256 MyEEPROM(0x57); //define o endereço base da EEPROM
 
 int PinCorrente = 0;
 extern int BAR = 0;
-#define WP 33
+#define WP 25
 #define ANALOG_PIN_0 32  //15
 #define ANALOG_PIN_1 33 //4
 #define RXD2 16  // Pino RX para Serial2 (ajuste conforme necessário)
