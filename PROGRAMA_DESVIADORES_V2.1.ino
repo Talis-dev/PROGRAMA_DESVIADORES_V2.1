@@ -25,6 +25,15 @@ const unsigned long mqttCheckInterval = 5000;  // 5 segundos
 WiFiClient espClient;
 PubSubClient client(espClient);
 
+// ========== CONTROLE DUAL-CORE ESP32 ==========
+TaskHandle_t TaskControleHandle;  // Task no Core 0 (Controle Crítico)
+SemaphoreHandle_t xMutex;          // Mutex para proteção de variáveis compartilhadas
+
+// Variáveis de monitoramento de performance
+unsigned long loopCore0Count = 0;
+unsigned long loopCore1Count = 0;
+unsigned long lastPerfReport = 0;
+
 extern PCF8574 PCF_38(0x38); // enderesso modulos saidas i2c
 extern PCF8574 PCF_39(0x39);  //  (used as output)
 extern int RL[17] = {0};
@@ -169,6 +178,10 @@ extern int telaAtiva;
 extern int tempo0=0, tempo1=0, tempo2=0, tempo3=0, tempo4=0, tempo5=0, tempo6=0, tempo7=0, tempo8=0, tempo9=0, tempo10=0,tempo11=0;
 extern bool M1=0, M2=0, M3=0, M4=0, M5=0, M6=0, M7=0, M8=0, M9=0, M10=0, M11=0, M12=0;
 
+// Declaração de variáveis de proteção (definidas em Sequencial.ino)
+extern bool emResetCoxa;
+extern bool emResetPeito;
+
 
 NexTouch *nex_listen_list[] = 
 {
@@ -211,21 +224,59 @@ void addButtonsToJson(JsonDocument& doc) {
   buttons["bt12var"] = bt12var; 
 }
 
+void addPerformanceToJson(JsonDocument& doc) {
+  JsonObject performance = doc.createNestedObject("performance");
+  performance["core0_cycles"] = loopCore0Count;
+  performance["core1_cycles"] = loopCore1Count;
+  
+  // Cálculo de frequência (ciclos por segundo)
+  static unsigned long lastCalc = 0;
+  unsigned long elapsed = millis() - lastCalc;
+  if (elapsed > 0) {
+    performance["core0_hz"] = (loopCore0Count * 1000) / elapsed;
+    performance["core1_hz"] = (loopCore1Count * 1000) / elapsed;
+  }
+}
+
+void addWiFiInfoToJson(JsonDocument& doc) {
+  if (wifiConnected) {
+    JsonObject wifi = doc.createNestedObject("wifi");
+    wifi["rssi"] = WiFi.RSSI();  // Nível de sinal em dBm
+    wifi["quality"] = map(constrain(WiFi.RSSI(), -100, -50), -100, -50, 0, 100); // 0-100%
+    wifi["ip"] = WiFi.localIP().toString();
+    wifi["ssid"] = WiFi.SSID();
+  }
+}
+
 
 // Função para publicar status MQTT (se conectado)
 void publishStatus() {
   if (mqttConnected && client.connected()) {
-    StaticJsonDocument<200> doc;
+    StaticJsonDocument<512> doc;  // Aumentado de 200 para 512 bytes
+    
+    // Dados básicos
     doc["bat_voltage"] = tensaoMedia;
     doc["pressure"] = BAR;
     doc["wifi_connected"] = wifiConnected;
     doc["uptime"] = millis() / 1000;
+    
+    // Adicionar timers e botões
     addTimersToJson(doc);
     addButtonsToJson(doc);
+    
+    // Adicionar performance dual-core
+    addPerformanceToJson(doc);
+    
+    // Adicionar informações WiFi
+    addWiFiInfoToJson(doc);
 
     String output;
     serializeJson(doc, output);
     client.publish(mqtt_topic_status, output.c_str());
+    
+    // Log opcional no Serial (comente se não quiser)
+    // dbSerial.print("[MQTT] Status publicado: ");
+    // dbSerial.println(output);
   }
 }
 
@@ -380,70 +431,200 @@ void connectMQTT() {
   }
 }
 
-// Função para inicializar WiFi (não-bloqueante)
+// Função para inicializar WiFi (100% NÃO-BLOQUEANTE)
 void initWiFi() {
-  dbSerial.println("Inicializando WiFi Manager...");
+  dbSerial.println("[WiFi] Iniciando em background (não-bloqueante)...");
+  
+  // Configurações WiFi básicas
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  
+  // Tenta conectar com credenciais salvas (não-bloqueante)
+  WiFi.begin();
+  
+  dbSerial.println("[WiFi] Tentando conectar em background...");
+  dbSerial.println("[WiFi] Sistema de controle continuará funcionando normalmente");
+  
+  wifiConnected = false; // Será atualizado pelo checkConnections()
+}
+
+// Função para iniciar portal de configuração WiFi (apenas se solicitado)
+void startWiFiConfig() {
+  dbSerial.println("[WiFi] Iniciando portal de configuração...");
   
   WiFiManager wm;
+  wm.setConfigPortalTimeout(180);  // 3 minutos
+  wm.startConfigPortal("DESVIADOR_ESTEIRAS");
   
-  // Configurações de timeout para não bloquear
-  wm.setConfigPortalTimeout(120);  // 2 minutos para configuração
-  wm.setConnectTimeout(10);        // 10 segundos para conectar
-  wm.setTimeout(120);              // timeout geral
-  
-  // Tenta conectar automaticamente
-  bool connected = wm.autoConnect("DESVIADOR_ESTEIRAS");
-  
-  if (connected) {
-    dbSerial.println("WiFi conectado!");
-    dbSerial.print("IP: ");
-    dbSerial.println(WiFi.localIP());
+  if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
-    
-    // Configurar MQTT
     client.setServer(mqtt_server, mqtt_port);
     client.setCallback(callback);
     client.setBufferSize(1024);
-    
-  } else {
-    dbSerial.println("WiFi não conectado - continuando sem WiFi");
-    wifiConnected = false;
+    dbSerial.println("[WiFi] Configurado com sucesso!");
   }
 }
 
-// Função para verificar conexões periodicamente
+// Função para verificar conexões periodicamente (NÃO-BLOQUEANTE)
 void checkConnections() {
+  static unsigned long wifiReconnectAttempt = 0;
+  static int wifiRetryCount = 0;
   unsigned long currentTime = millis();
   
-  // Verifica WiFi a cada 30 segundos
+  // ===== VERIFICAÇÃO WiFi a cada 30 segundos =====
   if (currentTime - lastWifiCheck > wifiCheckInterval) {
     lastWifiCheck = currentTime;
     
-    if (WiFi.status() != WL_CONNECTED) {
-      wifiConnected = false;
-      mqttConnected = false;
-      dbSerial.println("WiFi desconectado");
-    } else if (!wifiConnected) {
-      wifiConnected = true;
-      dbSerial.println("WiFi reconectado!");
-      client.setServer(mqtt_server, mqtt_port);
-      client.setCallback(callback);
+    wl_status_t status = WiFi.status();
+    
+    if (status != WL_CONNECTED) {
+      if (wifiConnected) {
+        // Perdeu conexão
+        dbSerial.println("[WiFi] Conexão perdida");
+        wifiConnected = false;
+        mqttConnected = false;
+      }
+      
+      // Tentativa de reconexão NÃO-BLOQUEANTE
+      if (currentTime - wifiReconnectAttempt > 60000) { // A cada 60s
+        wifiReconnectAttempt = currentTime;
+        wifiRetryCount++;
+        
+        dbSerial.print("[WiFi] Tentativa de reconexão #");
+        dbSerial.println(wifiRetryCount);
+        
+        WiFi.disconnect();
+        delay(100);
+        WiFi.begin(); // Reconecta com credenciais salvas
+        
+        // Watchdog: Resetar WiFi se muitas falhas
+        if (wifiRetryCount > 10) {
+          dbSerial.println("[WiFi] Muitas falhas - resetando WiFi");
+          WiFi.mode(WIFI_OFF);
+          delay(1000);
+          WiFi.mode(WIFI_STA);
+          WiFi.setAutoReconnect(true);
+          WiFi.begin();
+          wifiRetryCount = 0;
+        }
+      }
+      
+    } else {
+      // WiFi conectado
+      if (!wifiConnected) {
+        // Reconectou!
+        wifiConnected = true;
+        wifiRetryCount = 0;
+        
+        dbSerial.println("[WiFi] Reconectado com sucesso!");
+        dbSerial.print("[WiFi] IP: ");
+        dbSerial.println(WiFi.localIP());
+        dbSerial.print("[WiFi] RSSI: ");
+        dbSerial.print(WiFi.RSSI());
+        dbSerial.println(" dBm");
+        
+        // Reconfigurar MQTT
+        client.setServer(mqtt_server, mqtt_port);
+        client.setCallback(callback);
+        client.setBufferSize(1024);
+      }
     }
   }
   
-  // Verifica MQTT a cada 5 segundos
+  // ===== VERIFICAÇÃO MQTT a cada 5 segundos =====
   if (wifiConnected && (currentTime - lastMqttCheck > mqttCheckInterval)) {
     lastMqttCheck = currentTime;
     
     if (!client.connected()) {
       mqttConnected = false;
-      connectMQTT();
+      connectMQTT(); // Já é não-bloqueante
+    } else {
+      mqttConnected = true;
     }
   }
 }
 
 
 
+// ========== TASK CORE 0 - CONTROLE CRÍTICO (IHM + RELÉS + SEQUENCIAL) ==========
+void TaskControle(void *pvParameters) {
+  dbSerial.println("[CORE 0] Task Controle iniciada");
+  
+  unsigned long Tvarre_local = 0;
+  unsigned long cloock_local = 0;
+  bool carregaeeprom_local = false;
+  
+  // Loop infinito da Task
+  for(;;) {
+    loopCore0Count++;
+    
+    // ===== IHM NEXTION - MÁXIMA PRIORIDADE =====
+    nexLoop(nex_listen_list);
+    
+    // ===== CARREGAMENTO INICIAL EEPROM =====
+    if(!carregaeeprom_local) {
+      carregaeeprom_local = true;
+      LoadingEeprom();
+    }
+    
+    // ===== VARREDURA 100ms - CONTROLE DE SAÍDAS =====
+    if (millis() - Tvarre_local > 100 && shiftButton == 0) {
+      Tvarre_local = millis();
+      
+      // Usar mutex para ler variáveis compartilhadas
+      if (xSemaphoreTake(xMutex, 10 / portTICK_PERIOD_MS)) {
+        Varredura();
+        
+        if(bt10var == 1) {
+          carregaTempo();
+        }
+        
+        WriteI2C(); // CRÍTICO: Escrita nos relés I2C
+        
+        xSemaphoreGive(xMutex);
+      }
+    }
+    
+    // ===== INCREMENTO DE TIMERS 1s =====
+    if (millis() - cloock_local > 1000) {
+      if (xSemaphoreTake(xMutex, 10 / portTICK_PERIOD_MS)) {
+        
+        if(bt10var == 1) {  
+          // INCREMENTAR APENAS SE NÃO ESTIVER EM RESET
+          if(bt0var == 1 && !emResetCoxa){tempo0++;}
+          if(bt1var == 1 && !emResetCoxa){tempo1++;}
+          if(bt2var == 1 && !emResetCoxa){tempo2++;}
+          if(bt3var == 1 && !emResetCoxa){tempo3++;}
+          
+          if(bt4var == 1){tempo4++;}
+          if(bt5var == 1){tempo5++;}
+          
+          if(bt6var == 1 && !emResetPeito){tempo6++;}
+          if(bt7var == 1 && !emResetPeito){tempo7++;}
+          if(bt8var == 1 && !emResetPeito){tempo8++;}
+          if(bt9var == 1 && !emResetPeito){tempo9++;}
+          
+          if(bt11var == 1){tempo10++;}
+          if(bt12var == 1){tempo11++;}
+          
+        } else {
+          // Sistema parado - garantir estado seguro
+          RL[1]=0; RL[2]=0; RL[3]=0; RL[4]=0; RL[5]=0; RL[6]=0; RL[7]=0; RL[8]=0;
+          imagem4=0; imagem6=0; imagem10=0; imagem11=0;
+        }
+        
+        xSemaphoreGive(xMutex);
+      }
+      
+      cloock_local = millis();
+    }
+    
+    // Delay mínimo para não travar o watchdog
+    vTaskDelay(1 / portTICK_PERIOD_MS); // 1ms
+  }
+}
+
+// ========== SETUP ==========
 void setup() {
    esp_log_level_set("i2c.master", ESP_LOG_NONE);
   esp_log_level_set("i2c", ESP_LOG_NONE);
@@ -472,79 +653,99 @@ digitalWrite(Q0,HIGH);
   dbSerial.println("CARREGANDO IHM...");
   delay(100); // aguarde equanto a ihm inicializa
 
-  // Tentar conectar WiFi (não-obrigatório)
+  // ========== CRIAR MUTEX PARA PROTEÇÃO DE VARIÁVEIS ==========
+  xMutex = xSemaphoreCreateMutex();
+  if (xMutex == NULL) {
+    dbSerial.println("[ERRO] Falha ao criar Mutex!");
+  } else {
+    dbSerial.println("[OK] Mutex criado com sucesso");
+  }
+  
+  // ========== CRIAR TASK NO CORE 0 (CONTROLE CRÍTICO) ==========
+  xTaskCreatePinnedToCore(
+    TaskControle,          // Função da Task
+    "TaskControle",        // Nome da Task
+    10000,                 // Stack size (bytes)
+    NULL,                  // Parâmetros
+    2,                     // Prioridade (2 = Alta, maior que loop)
+    &TaskControleHandle,   // Handle da Task
+    0                      // Core 0 (dedicado ao controle)
+  );
+  
+  if (TaskControleHandle == NULL) {
+    dbSerial.println("[ERRO] Falha ao criar Task Core 0!");
+  } else {
+    dbSerial.println("[OK] Task Core 0 criada - Controle Crítico ativo");
+  }
+  
+  delay(500); // Aguardar Task inicializar
+  
+  // ===== INICIAR WiFi em BACKGROUND (NÃO BLOQUEIA) =====
+  // WiFi conectará automaticamente em segundo plano
+  // Sistema de controle funciona INDEPENDENTE do WiFi
   initWiFi();
 
-  dbSerial.println("=== SISTEMA INICIADO ===");
-  dbSerial.print("WiFi: ");
-  dbSerial.println(wifiConnected ? "CONECTADO" : "DESCONECTADO");
-  dbSerial.print("MQTT: ");
-  dbSerial.println(mqttConnected ? "CONECTADO" : "DESCONECTADO");
-
-
+  dbSerial.println("\n=== SISTEMA DUAL-CORE INICIADO ===");
+  dbSerial.println("CORE 0: IHM + Relés + Sequencial (Tempo Real)");
+  dbSerial.println("CORE 1: WiFi + MQTT + Sensores (Background)");
+  dbSerial.println("\n[INFO] Sistema de controle ativo - WiFi conectando em background");
+  dbSerial.println("[INFO] Desviadores funcionam mesmo sem WiFi\n");
 
 } // end setup
 
+// ========== LOOP CORE 1 - BACKGROUND (WiFi/MQTT/Sensores) ==========
 void loop() {
-  nexLoop(nex_listen_list);
-
-  //----------------------------------- Tempo de varredura troca de dados nextion --------------------------//
- if(carregaeeprom==0){
-  carregaeeprom = 1;
-  LoadingEeprom();
- }
-
-  if (millis() - Tvarre > 100 && shiftButton ==0) {
-    Tvarre = millis();
-    Varredura();
-    
-if(bt10var == 1){
-  carregaTempo();
-}
-    WriteI2C(); // carrega escrita dos reles i2c
-  }
-  //----------------------------------------- end ----------------------------------------------//
- 
-if (millis() - cloock > 1000){
-if(bt10var == 1){  
+  loopCore1Count++;
   
-if(bt0var == 1){tempo0 ++;}
-if(bt1var == 1){tempo1 ++;}
-if(bt2var == 1){tempo2 ++;}
-if(bt3var == 1){tempo3 ++;}
-if(bt4var == 1){tempo4 ++;}
-if(bt5var == 1){tempo5 ++;}
-if(bt6var == 1){tempo6 ++;}
-if(bt7var == 1){tempo7 ++;}
-if(bt8var == 1){tempo8 ++;}
-if(bt9var == 1){tempo9 ++;}
-if(bt11var == 1){tempo10 ++;}
-if(bt12var == 1){tempo11 ++;}
-
-} else{
-RL[1]= 0; RL[2]= 0; RL[3]= 0; RL[4]= 0; RL[5]= 0;RL[6]= 0;RL[7]= 0; RL[8]= 0;
-imagem4=0; imagem6=0; imagem10=0; imagem11=0;
-}
-
-
-if(telaAtiva == 0){calculos(); }
-cloock = millis();
-} // end 1seg
-
-
-// Verificar conexões WiFi/MQTT (não-bloqueante)
+  static unsigned long cloock_sensors = 0;
+  
+  // ===== LEITURA DE SENSORES 1s (com mutex) =====
+  if (millis() - cloock_sensors > 1000) {
+    if (xSemaphoreTake(xMutex, 20 / portTICK_PERIOD_MS)) {
+      if(telaAtiva == 0) {
+        calculos(); // RTC, Bateria, Pressão
+      }
+      xSemaphoreGive(xMutex);
+    }
+    cloock_sensors = millis();
+  }
+  
+  // ===== VERIFICAR CONEXÕES WiFi/MQTT =====
   checkConnections();
- // Manter conexão MQTT ativa
+  
+  // ===== MANTER CONEXÃO MQTT ATIVA =====
   if (mqttConnected) {
     client.loop();
   }
-
- static unsigned long lastMqttPublish = 0;
- if (millis() - lastMqttPublish > 10000) {
-     lastMqttPublish = millis();
+  
+  // ===== PUBLICAR STATUS MQTT 10s =====
+  static unsigned long lastMqttPublish = 0;
+  if (millis() - lastMqttPublish > 10000) {
+    lastMqttPublish = millis();
+    if (xSemaphoreTake(xMutex, 50 / portTICK_PERIOD_MS)) {
       publishStatus();
-      }
- 
+      xSemaphoreGive(xMutex);
+    }
+  }
+  
+  // ===== RELATÓRIO DE PERFORMANCE 30s (Debug) =====
+  if (millis() - lastPerfReport > 30000) {
+    dbSerial.println("\n=== PERFORMANCE DUAL-CORE ===");
+    dbSerial.print("Core 0 (Controle): ");
+    dbSerial.print(loopCore0Count);
+    dbSerial.println(" ciclos/30s");
+    dbSerial.print("Core 1 (WiFi/MQTT): ");
+    dbSerial.print(loopCore1Count);
+    dbSerial.println(" ciclos/30s");
+    
+    loopCore0Count = 0;
+    loopCore1Count = 0;
+    lastPerfReport = millis();
+  }
+  
+  // Delay para não sobrecarregar Core 1
+  delay(10);
+  
 }// end loop
 
 void calculos(){
