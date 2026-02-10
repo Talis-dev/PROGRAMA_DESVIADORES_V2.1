@@ -224,6 +224,26 @@ void addButtonsToJson(JsonDocument& doc) {
   buttons["bt12var"] = bt12var; 
 }
 
+void addRelaysToJson(JsonDocument& doc) {
+  JsonObject relays = doc.createNestedObject("relays");
+  relays["RL1"] = RL[1];
+  relays["RL2"] = RL[2];
+  relays["RL3"] = RL[3];
+  relays["RL4"] = RL[4];
+  relays["RL5"] = RL[5];
+  relays["RL6"] = RL[6];
+  relays["RL7"] = RL[7];
+  relays["RL8"] = RL[8];
+  relays["RL9"] = RL[9];
+  relays["RL10"] = RL[10];
+  relays["RL11"] = RL[11];
+  relays["RL12"] = RL[12];
+  relays["RL13"] = RL[13];
+  relays["RL14"] = RL[14];
+  relays["RL15"] = RL[15];
+  relays["RL16"] = RL[16];
+}
+
 void addPerformanceToJson(JsonDocument& doc) {
   JsonObject performance = doc.createNestedObject("performance");
   performance["core0_cycles"] = loopCore0Count;
@@ -251,34 +271,54 @@ void addWiFiInfoToJson(JsonDocument& doc) {
 
 // Função para publicar status MQTT (se conectado)
 void publishStatus() {
-  if (mqttConnected && client.connected()) {
-    StaticJsonDocument<512> doc;  // Aumentado de 200 para 512 bytes
-    
-    // Dados básicos
-    doc["bat_voltage"] = tensaoMedia;
-    doc["pressure"] = BAR;
-    doc["wifi_connected"] = wifiConnected;
-    doc["uptime"] = millis() / 1000;
-    
-    // Adicionar timers e botões
-    addTimersToJson(doc);
-    addButtonsToJson(doc);
-    
-    // Adicionar performance dual-core
-    addPerformanceToJson(doc);
-    
-    // Adicionar informações WiFi
-    addWiFiInfoToJson(doc);
+  // PROTEÇÃO: Só publicar se MQTT realmente conectado
+  if (!mqttConnected || !client.connected()) {
+    return; // Sai imediatamente se desconectado
+  }
+  
+  StaticJsonDocument<768> doc;  // Aumentado para comportar relays
+  
+  // Dados básicos
+  doc["bat_voltage"] = tensaoMedia;
+  doc["pressure"] = BAR;
+  doc["wifi_connected"] = wifiConnected;
+  doc["uptime"] = millis() / 1000;
+  
+  // Adicionar timers e botões
+  addTimersToJson(doc);
+  addButtonsToJson(doc);
+  
+  // Adicionar estados dos relés (CRÍTICO para diagnóstico)
+  addRelaysToJson(doc);
+  
+  // Adicionar performance dual-core
+  addPerformanceToJson(doc);
+  
+  // Adicionar informações WiFi
+  addWiFiInfoToJson(doc);
 
-    String output;
-    serializeJson(doc, output);
-    client.publish(mqtt_topic_status, output.c_str());
+  String output;
+  serializeJson(doc, output);
+  
+  // PROTEÇÃO: Verificar se mensagem não está muito grande
+  if (output.length() > 1000) {
+    dbSerial.println("[WARN] Mensagem MQTT muito grande - não enviando");
+    return;
+  }
+  
+  // PROTEÇÃO: Verificar se client ainda está conectado antes de publicar
+  if (client.connected()) {
+    bool published = client.publish(mqtt_topic_status, output.c_str());
+    if (!published) {
+      dbSerial.println("[WARN] Falha ao publicar MQTT - buffer cheio?");
+    }
+  }
     
     // Log opcional no Serial (comente se não quiser)
     // dbSerial.print("[MQTT] Status publicado: ");
     // dbSerial.println(output);
   }
-}
+
 
 
 // Função callback MQTT
@@ -336,6 +376,10 @@ if (String(topic) == mqtt_topic_command) {
     String jsonOut;
     serializeJson(resp, jsonOut);
     client.publish(mqtt_topic_status, jsonOut.c_str());
+    
+    // Publicar status completo imediatamente após comando
+    delay(50);
+    publishStatus();
   }
 
 
@@ -371,6 +415,9 @@ String jsonOut;
 serializeJson(resp, jsonOut);
 client.publish(mqtt_topic_status, jsonOut.c_str());
 
+  // Publicar status completo imediatamente após comando
+  delay(50);
+  publishStatus();
 }
 
 // === Comando: alterar estado de botão ===
@@ -399,13 +446,16 @@ else if (cmd == "set_button") {
     dbSerial.println("Índice de botão inválido!");
   }
   StaticJsonDocument<100> resp;
-resp["status"] = "timer_updated";
+resp["status"] = "button_updated";
 resp["index"] = index;
 resp["state"] = state;
 String jsonOut;
 serializeJson(resp, jsonOut);
 client.publish(mqtt_topic_status, jsonOut.c_str());
 
+  // Publicar status completo imediatamente após comando
+  delay(50);
+  publishStatus();
 }
 
 
@@ -424,7 +474,7 @@ void connectMQTT() {
       client.publish(mqtt_topic_status, "online");
       mqttConnected = true;
     } else {
-      dbSerial.print(" falha, rc=");
+      dbSerial.print(" falha mqtt, client state = ");
       dbSerial.println(client.state());
       mqttConnected = false;
     }
@@ -494,14 +544,13 @@ void checkConnections() {
         dbSerial.println(wifiRetryCount);
         
         WiFi.disconnect();
-        delay(100);
-        WiFi.begin(); // Reconecta com credenciais salvas
+        WiFi.begin(); // Reconecta com credenciais salvas - NÃO BLOQUEANTE
         
         // Watchdog: Resetar WiFi se muitas falhas
         if (wifiRetryCount > 10) {
           dbSerial.println("[WiFi] Muitas falhas - resetando WiFi");
           WiFi.mode(WIFI_OFF);
-          delay(1000);
+          // REMOVIDO delay(1000) - BLOQUEANTE!
           WiFi.mode(WIFI_STA);
           WiFi.setAutoReconnect(true);
           WiFi.begin();
@@ -647,9 +696,11 @@ digitalWrite(Q0,HIGH);
      dbSerial.println("falha no RTC");
   }
 // rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-  PCF_38.begin(); //expansao i2c
-  PCF_39.begin(); 
-    dbSerial.println("a carregar dados NVRAM values:");
+  
+  // ========== INICIALIZAR E VERIFICAR PCF8574 ==========
+  initPCF8574();
+  
+  dbSerial.println("a carregar dados NVRAM values:");
   dbSerial.println("CARREGANDO IHM...");
   delay(100); // aguarde equanto a ihm inicializa
 
@@ -713,18 +764,25 @@ void loop() {
   // ===== VERIFICAR CONEXÕES WiFi/MQTT =====
   checkConnections();
   
-  // ===== MANTER CONEXÃO MQTT ATIVA =====
-  if (mqttConnected) {
-    client.loop();
+  // ===== MANTER CONEXÃO MQTT ATIVA (COM PROTEÇÃO) =====
+  if (mqttConnected && client.connected()) {
+    client.loop(); // Processa mensagens MQTT de forma não-bloqueante
+  } else if (mqttConnected && !client.connected()) {
+    // Conexão MQTT perdida - atualizar estado
+    mqttConnected = false;
+    dbSerial.println("[MQTT] Conexão perdida - marcando como desconectado");
   }
   
   // ===== PUBLICAR STATUS MQTT 10s =====
   static unsigned long lastMqttPublish = 0;
   if (millis() - lastMqttPublish > 10000) {
     lastMqttPublish = millis();
-    if (xSemaphoreTake(xMutex, 50 / portTICK_PERIOD_MS)) {
+    if (xSemaphoreTake(xMutex, 100 / portTICK_PERIOD_MS)) {
       publishStatus();
       xSemaphoreGive(xMutex);
+    } else {
+      // Mutex ocupado - pular publicação para não travar
+      dbSerial.println("[WARN] Mutex ocupado - pulando publicação MQTT");
     }
   }
   

@@ -45,6 +45,15 @@ if (bt6var == 0 && RL[5] == 0) { imagem7 = 1; }
 if (bt7var == 0 && RL[6] == 0) { imagem8 = 1; }
 if (bt8var == 0 && RL[7] == 0) { imagem9 = 1; }
 
+// FORÇAR DESLIGAMENTO se botão foi DESABILITADO pelo usuário
+// Isso previne relés ficarem ligados quando botão é desligado manualmente
+if (bt0var == 0) { RL[1] = 0; }
+if (bt1var == 0) { RL[2] = 0; }
+if (bt2var == 0) { RL[3] = 0; }
+if (bt6var == 0) { RL[5] = 0; }
+if (bt7var == 0) { RL[6] = 0; }
+if (bt8var == 0) { RL[7] = 0; }
+
 if(telaAtiva == 0){
 
 if(imagem1 != Ant1){Ant1 = imagem1;p0.setPic(imagem1);  }
@@ -122,8 +131,7 @@ if(imagem12 != Ant12){Ant12 = imagem12;p11.setPic(imagem12);  }
         M2 = 1;
         tempo2 = 0;
       }
-      // GARANTIR atualização SEMPRE que botão desligar
-      RL[2] = 0;
+      // NÃO FORÇAR RL[2]=0 - já foi temporizado
       imagem2 = 1;
     }
   }
@@ -148,8 +156,7 @@ if(imagem12 != Ant12){Ant12 = imagem12;p11.setPic(imagem12);  }
         M3 = 1;
         tempo3 = 0;
       }
-      // GARANTIR atualização SEMPRE que botão desligar
-      RL[3] = 0;   
+      // NÃO FORÇAR RL[3]=0 - já foi temporizado
       imagem3 = 1;
     }
   }
@@ -265,8 +272,8 @@ if (bt0var==1 || bt1var==1 || bt2var==1){
         M6 = 1;
         tempo8 = 0;
       }
-      // GARANTIR atualização SEMPRE que botão desligar
-      RL[6] = 0;
+      // NÃO FORÇAR RL[6]=0 AQUI - RL[6] já foi temporizado no if acima
+      // Apenas atualizar imagem
       imagem8 = 1;
     }
   }
@@ -294,7 +301,8 @@ if (bt0var==1 || bt1var==1 || bt2var==1){
         M7 = 1;
         tempo9 = 0;
       }
-      // GARANTIR atualização SEMPRE que botão desligar
+      // NÃO FORÇAR RL[6]=0 - ele já foi temporizado no bloco anterior
+      // Apenas garantir RL[7]=0 (botão bt8 desligado)
       RL[7] = 0;
       imagem9 = 1;
     }
